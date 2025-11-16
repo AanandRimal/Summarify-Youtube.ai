@@ -6,6 +6,7 @@ import re
 import os
 import base64
 import tempfile
+import json
 from dotenv import load_dotenv
 from groq import Groq
 import httpx
@@ -39,7 +40,14 @@ async def hello():
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Neo4j setup
+# Groq model configuration - can be overridden via environment variable
+# NOTE: llama-3.3-70b-specdec was deprecated on March 24, 2025
+# Recommended alternatives: llama-3.1-70b-versatile, llama-3.3-70b-versatile, llama-3.1-8b-instant
+# Or: deepseek-r1-distill-llama-70b, deepseek-r1-distill-qwen-32b (for reasoning tasks)
+# Check https://console.groq.com/docs/models for current available models
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")  # Default to stable versatile model
+
+# Neo4j setup (optional)
 neo4j_uri = os.getenv("NEO4J_URI")
 neo4j_user = os.getenv("NEO4J_USERNAME")  
 neo4j_password = os.getenv("NEO4J_PASSWORD")
@@ -88,6 +96,14 @@ class VideoResponse(BaseModel):
     success: bool
     summary: str
     message: Optional[str] = None
+    video_id: Optional[str] = None
+    video_title: Optional[str] = None
+    tags: Optional[List[str]] = None
+    key_takeaway: Optional[str] = None
+    key_points: Optional[List[str]] = None
+    how_it_started: Optional[str] = None
+    top_topics: Optional[List[Dict[str, str]]] = None  # List of {topic, timestamp, description}
+    new_things: Optional[List[str]] = None
 
 class QuestionResponse(BaseModel):
     success: bool
@@ -141,7 +157,7 @@ def create_knowledge_graph(video_id: str, transcript_text: str):
             
             response = groq_client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-specdec",
+                model=GROQ_MODEL,
                 temperature=0.3,
             )
             
@@ -200,11 +216,134 @@ def enforce_language(text: str, target_language: str) -> str:
     
     response = groq_client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-specdec",
+        model=GROQ_MODEL,
         temperature=0.3,
     )
     
     return response.choices[0].message.content.strip()
+
+def generate_structured_summary(video_id: str, transcript_text: str, transcript_data: List[Dict], style: str, word_count: int, language: str = "english") -> Dict:
+    """Generate a comprehensive structured summary with all required fields"""
+    
+    # Create timestamp map for transcript
+    timestamp_map = {}
+    for entry in transcript_data:
+        start_time = int(entry.get("start", 0))
+        minutes = start_time // 60
+        seconds = start_time % 60
+        timestamp_str = f"{minutes:02d}:{seconds:02d}"
+        if timestamp_str not in timestamp_map:
+            timestamp_map[timestamp_str] = entry["text"]
+    
+    # Generate comprehensive structured summary
+    structured_prompt = f"""Analyze this video transcript and provide a comprehensive structured summary in JSON format.
+
+Video Transcript:
+{transcript_text}
+
+Please provide the following information in JSON format:
+1. **key_takeaway**: A one-sentence key takeaway from the video (max 200 words)
+2. **key_points**: List of 5-7 key points discussed (each point should be 1-2 sentences)
+3. **how_it_started**: How the video started - what was the opening/introduction (2-3 sentences)
+4. **top_topics**: List of exactly 10 important topics discussed, each with:
+   - topic: The topic name
+   - timestamp: Approximate time when this topic was discussed (format: MM:SS)
+   - description: Brief description of what was discussed about this topic (1-2 sentences)
+5. **tags**: List of 8-12 relevant tags/keywords (single words or short phrases)
+6. **new_things**: List of 3-5 new or interesting things mentioned in the video (each 1 sentence)
+7. **summary**: A comprehensive {style} summary of approximately {word_count} words covering the entire video
+
+Important:
+- For timestamps, estimate based on the content flow (divide transcript length proportionally)
+- Make the summary {style} in nature
+- Ensure all fields are filled
+- Return ONLY valid JSON, no markdown formatting or extra text
+
+JSON Format:
+{{
+  "key_takeaway": "...",
+  "key_points": ["...", "..."],
+  "how_it_started": "...",
+  "top_topics": [
+    {{"topic": "...", "timestamp": "MM:SS", "description": "..."}},
+    ...
+  ],
+  "tags": ["...", "..."],
+  "new_things": ["...", "..."],
+  "summary": "..."
+}}
+"""
+    
+    try:
+        # Try with JSON response format first
+        summary_response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": structured_prompt}],
+            model=GROQ_MODEL,
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+    except Exception as e:
+        # Fallback if JSON format is not supported
+        print(f"JSON format not supported, trying without: {str(e)}")
+        summary_response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": structured_prompt}],
+            model=GROQ_MODEL,
+            temperature=0.7
+        )
+    
+    try:
+        content = summary_response.choices[0].message.content
+        structured_data = json.loads(content)
+    except json.JSONDecodeError:
+        # Fallback if JSON parsing fails
+        content = summary_response.choices[0].message.content
+        # Try to extract JSON from markdown code blocks
+        import re
+        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+        if json_match:
+            try:
+                structured_data = json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                structured_data = None
+        else:
+            # Try to find JSON object in the content
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                try:
+                    structured_data = json.loads(json_match.group(0))
+                except json.JSONDecodeError:
+                    structured_data = None
+        
+        # Last resort: create basic structure
+        if not structured_data:
+            structured_data = {
+                "key_takeaway": content[:200] if len(content) > 200 else content,
+                "key_points": [],
+                "how_it_started": "The video begins with an introduction.",
+                "top_topics": [],
+                "tags": [],
+                "new_things": [],
+                "summary": content
+            }
+    
+    # Enforce language for all text fields
+    if language.lower() != "english":
+        if structured_data.get("key_takeaway"):
+            structured_data["key_takeaway"] = enforce_language(structured_data["key_takeaway"], language)
+        if structured_data.get("key_points"):
+            structured_data["key_points"] = [enforce_language(point, language) for point in structured_data["key_points"]]
+        if structured_data.get("how_it_started"):
+            structured_data["how_it_started"] = enforce_language(structured_data["how_it_started"], language)
+        if structured_data.get("top_topics"):
+            for topic in structured_data["top_topics"]:
+                topic["topic"] = enforce_language(topic.get("topic", ""), language)
+                topic["description"] = enforce_language(topic.get("description", ""), language)
+        if structured_data.get("summary"):
+            structured_data["summary"] = enforce_language(structured_data["summary"], language)
+        if structured_data.get("new_things"):
+            structured_data["new_things"] = [enforce_language(thing, language) for thing in structured_data["new_things"]]
+    
+    return structured_data
 
 def generate_graph_based_summary(video_id: str, style: str, word_count: int, language: str = "english") -> str:
     with neo4j_driver.session() as session:
@@ -252,7 +391,7 @@ def generate_graph_based_summary(video_id: str, style: str, word_count: int, lan
         
         summary_response = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": summary_prompt}],
-            model="llama-3.3-70b-specdec",
+            model=GROQ_MODEL,
             temperature=0.7,
         )
         
@@ -301,7 +440,7 @@ def answer_question_with_graph(video_id: str, question: str, language: str = "en
         
         answer_response = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": answer_prompt}],
-            model="llama-3.3-70b-specdec",
+            model=GROQ_MODEL,
             temperature=0.5,
         )
         
@@ -353,24 +492,42 @@ async def speech_to_text(request: SpeechToTextRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing audio: {str(e)}")
 
+def get_video_title(video_id: str) -> str:
+    """Fetch video title from YouTube using oEmbed API"""
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        response = httpx.get(oembed_url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get("title", "YouTube Video")
+    except Exception as e:
+        print(f"Error fetching video title: {str(e)}")
+    return "YouTube Video"
+
 @app.post("/process-video", response_model=VideoResponse)
 async def process_video(request: VideoRequest):
     try:
         video_id = extract_video_id(request.video_url)
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            yt_api = YouTubeTranscriptApi()
+            transcript_data = yt_api.fetch(video_id).to_raw_data()
             formatter = TextFormatter()
-            transcript_text = formatter.format_transcript(transcript)
+            transcript_text = formatter.format_transcript(transcript_data)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Could not fetch video transcript: {str(e)}")
         
         try:
+            # Get video title
+            video_title = get_video_title(video_id)
+            
             # Create knowledge graph
             create_knowledge_graph(video_id, transcript_text)
             
-            # Generate summary using graph with language support
-            summary = generate_graph_based_summary(
+            # Generate structured summary
+            structured_data = generate_structured_summary(
                 video_id=video_id,
+                transcript_text=transcript_text,
+                transcript_data=transcript_data,
                 style=request.style,
                 word_count=request.word_count,
                 language=request.language
@@ -378,7 +535,15 @@ async def process_video(request: VideoRequest):
             
             return VideoResponse(
                 success=True,
-                summary=summary,
+                video_id=video_id,
+                video_title=video_title,
+                summary=structured_data.get("summary", ""),
+                tags=structured_data.get("tags", []),
+                key_takeaway=structured_data.get("key_takeaway", ""),
+                key_points=structured_data.get("key_points", []),
+                how_it_started=structured_data.get("how_it_started", ""),
+                top_topics=structured_data.get("top_topics", []),
+                new_things=structured_data.get("new_things", []),
                 message="Video processed successfully"
             )
         except Exception as e:
